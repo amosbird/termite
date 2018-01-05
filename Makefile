@@ -2,12 +2,14 @@ VERSION = $(shell git describe --tags)
 GTK = gtk+-3.0
 VTE = vte-2.91
 PREFIX ?= /usr/local
+ETCDIR ?= ${PREFIX}/etc
 BINDIR ?= ${PREFIX}/bin
 DATADIR ?= ${PREFIX}/share
 MANDIR ?= ${DATADIR}/man
 TERMINFO ?= ${DATADIR}/terminfo
 
 CXXFLAGS := -std=c++11 -O3 \
+	    -rdynamic \
 	    -Wall -Wextra -pedantic \
 	    -Winit-self \
 	    -Wshadow \
@@ -41,7 +43,7 @@ termite: termite.cc url_regex.hh util/clamp.hh util/maybe.hh util/memory.hh
 install: termite termite.desktop termite.terminfo
 	mkdir -p ${DESTDIR}${TERMINFO}
 	install -Dm755 termite ${DESTDIR}${BINDIR}/termite
-	install -Dm644 config ${DESTDIR}/etc/xdg/termite/config
+	install -Dm644 config ${DESTDIR}${ETCDIR}/xdg/termite/config
 	install -Dm644 termite.desktop ${DESTDIR}${DATADIR}/applications/termite.desktop
 	install -Dm644 man/termite.1 ${DESTDIR}${MANDIR}/man1/termite.1
 	install -Dm644 man/termite.config.5 ${DESTDIR}${MANDIR}/man5/termite.config.5

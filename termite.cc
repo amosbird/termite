@@ -43,6 +43,8 @@
 #include "util/clamp.hh"
 #include "util/maybe.hh"
 #include "util/memory.hh"
+#include "fts_fuzzy_match.h"
+#include <iostream>
 
 using namespace std::placeholders;
 
@@ -863,16 +865,6 @@ gboolean key_press_cb(VteTerminal *vte, GdkEventKey *event, keybind_info *info) 
             }
             return TRUE;
         }
-        if (modifiers == GDK_SHIFT_MASK) {
-            switch (event->keyval) {
-                case GDK_KEY_Left:
-                    move_backward_word(vte, &info->select);
-                    return TRUE;
-                case GDK_KEY_Right:
-                    move_forward_word(vte, &info->select);
-                    return TRUE;
-            }
-        }
         switch (event->keyval) {
             case GDK_KEY_Escape:
             case GDK_KEY_q:
@@ -992,49 +984,25 @@ gboolean key_press_cb(VteTerminal *vte, GdkEventKey *event, keybind_info *info) 
         }
         return TRUE;
     }
-    if (modifiers == (GDK_CONTROL_MASK|GDK_SHIFT_MASK)) {
-        switch (gdk_keyval_to_lower(event->keyval)) {
-            case GDK_KEY_plus:
-                increase_font_scale(vte);
-                return TRUE;
-            case GDK_KEY_equal:
-                reset_font_scale(vte, info->config.font_scale);
-                return TRUE;
-            case GDK_KEY_t:
-                launch_in_directory(vte);
-                return TRUE;
-            case GDK_KEY_space:
-            case GDK_KEY_nobreakspace: // shift-space on some keyboard layouts
-                enter_command_mode(vte, &info->select);
-                return TRUE;
-            case GDK_KEY_x:
-                enter_command_mode(vte, &info->select);
-                find_urls(vte, &info->panel);
-                gtk_widget_show(info->panel.da);
-                overlay_show(&info->panel, overlay_mode::urlselect, nullptr);
-                exit_command_mode(vte, &info->select);
-                return TRUE;
-            case GDK_KEY_c:
-#if VTE_CHECK_VERSION(0, 50, 0)
-                vte_terminal_copy_clipboard_format(vte, VTE_FORMAT_TEXT);
-#else
-                vte_terminal_copy_clipboard(vte);
-#endif
-                return TRUE;
-            case GDK_KEY_v:
-                vte_terminal_paste_clipboard(vte);
-                return TRUE;
-            case GDK_KEY_r:
-                reload_config();
-                return TRUE;
-            case GDK_KEY_l:
-                vte_terminal_reset(vte, TRUE, TRUE);
-                return TRUE;
-            default:
-                if (modify_key_feed(event, info, modify_table))
-                    return TRUE;
-        }
-    } else if ((modifiers == (GDK_CONTROL_MASK|GDK_MOD1_MASK)) ||
+    // vi mode end
+
+    if (gdk_keyval_to_lower(event->keyval) == GDK_KEY_u &&
+        modifiers == (GDK_CONTROL_MASK|GDK_MOD1_MASK)) {
+        enter_command_mode(vte, &info->select);
+        find_urls(vte, &info->panel);
+        gtk_widget_show(info->panel.da);
+        overlay_show(&info->panel, overlay_mode::urlselect, nullptr);
+        exit_command_mode(vte, &info->select);
+        return TRUE;
+    }
+
+    if (event->keyval == GDK_KEY_BackSpace &&
+        modifiers == (GDK_SHIFT_MASK|GDK_MOD1_MASK)) {
+        vte_terminal_feed_child(info->vte, "\033[18;2~", -1);
+        return TRUE;
+    }
+
+    if ((modifiers == (GDK_CONTROL_MASK|GDK_MOD1_MASK)) ||
                (modifiers == (GDK_CONTROL_MASK|GDK_MOD1_MASK|GDK_SHIFT_MASK))) {
         if (modify_key_feed(event, info, modify_meta_table))
             return TRUE;
@@ -1043,23 +1011,82 @@ gboolean key_press_cb(VteTerminal *vte, GdkEventKey *event, keybind_info *info) 
             case GDK_KEY_Tab:
                 overlay_show(&info->panel, overlay_mode::completion, vte);
                 return TRUE;
-            case GDK_KEY_plus:
-            case GDK_KEY_KP_Add:
-                increase_font_scale(vte);
-                return TRUE;
-            case GDK_KEY_minus:
-            case GDK_KEY_KP_Subtract:
-                decrease_font_scale(vte);
-                return TRUE;
-            case GDK_KEY_equal:
-                reset_font_scale(vte, info->config.font_scale);
-                return TRUE;
             default:
                 if (modify_key_feed(event, info, modify_table))
                     return TRUE;
         }
     }
+
+    switch (gdk_keyval_to_lower(event->keyval)) {
+        case GDK_KEY_F1:
+            reset_font_scale(vte, info->config.font_scale);
+            return TRUE;
+        case GDK_KEY_F2:
+            decrease_font_scale(vte);
+            return TRUE;
+        case GDK_KEY_F3:
+            increase_font_scale(vte);
+            return TRUE;
+    }
+
     return FALSE;
+}
+
+keybind_info * amos_info;
+VteTerminal * amos_vte;
+
+gboolean amos_matcher(
+    GtkEntryCompletion* completion, const gchar* key, GtkTreeIter* iter, gpointer) {
+    GtkTreeModel* model = gtk_entry_completion_get_model(completion);
+    gchar* item;
+    gtk_tree_model_get(model, iter, 0, &item, -1);
+
+    gboolean ans = fts::fuzzy_match_simple(key, item);
+    g_free(item);
+    return ans;
+}
+
+extern "C"
+{
+    void amos_show_completion (char * c) {
+        search_panel_info * info = &amos_info->panel;
+        GtkEntryCompletion *completion = gtk_entry_completion_new();
+        gtk_entry_set_completion(GTK_ENTRY(info->entry), completion);
+        g_object_unref(completion);
+
+        GtkListStore *store = gtk_list_store_new(1, G_TYPE_STRING);
+        auto less = [](const char *a, const char *b) { return strcmp(a, b) < 0; };
+        std::set<const char *, decltype(less)> tokens(less);
+
+        for (char *s_ptr = c, *saveptr; ; s_ptr = nullptr) {
+            const char *token = strtok_r(s_ptr, " ", &saveptr);
+            if (!token) {
+                break;
+            }
+            tokens.insert(token);
+        }
+
+        for (const char *token : tokens) {
+            GtkTreeIter iter;
+            gtk_list_store_append(store, &iter);
+            gtk_list_store_set(store, &iter, 0, token, -1);
+        }
+
+        GtkTreeModel *completion_model = GTK_TREE_MODEL(store);
+
+        gtk_entry_completion_set_model(completion, completion_model);
+        g_object_unref(completion_model);
+
+        gtk_entry_completion_set_inline_selection(completion, TRUE);
+        gtk_entry_completion_set_text_column(completion, 0);
+        gtk_entry_completion_set_match_func(completion, (GtkEntryCompletionMatchFunc)amos_matcher, NULL, NULL);
+
+        gtk_entry_set_text(GTK_ENTRY(info->entry), "");
+
+        info->mode = overlay_mode::completion;
+        gtk_widget_show(info->entry);
+        gtk_widget_grab_focus(info->entry);
+    }
 }
 
 static void synthesize_keypress(GtkWidget *widget, unsigned keyval) {
@@ -1088,6 +1115,12 @@ gboolean entry_key_press_cb(GtkEntry *entry, GdkEventKey *event, keybind_info *i
             case GDK_KEY_bracketleft:
                 ret = TRUE;
                 break;
+            case GDK_KEY_j:
+                synthesize_keypress(GTK_WIDGET(entry), GDK_KEY_Down);
+                return TRUE;
+            case GDK_KEY_k:
+                synthesize_keypress(GTK_WIDGET(entry), GDK_KEY_Up);
+                return TRUE;
         }
     }
     switch (event->keyval) {
@@ -1190,10 +1223,20 @@ gboolean position_overlay_cb(GtkBin *overlay, GtkWidget *widget, GdkRectangle *a
     GtkRequisition req;
     gtk_widget_get_preferred_size(widget, nullptr, &req);
 
-    alloc->x = width - req.width - 40;
-    alloc->y = 0;
+    glong x, y;
+    amos_vte_terminal_get_cursor_position(amos_vte, &x, &y);
+
+    const int char_width = (int)vte_terminal_get_char_width(amos_vte);
+    const int char_height = (int)vte_terminal_get_char_height(amos_vte);
     alloc->width  = std::min(width, req.width);
+
+    int xpos = (int)x * char_width - 5;
+    int ypos = (int)y * char_height - 5;
+    if (xpos + alloc->width > width)
+        xpos = width - alloc->width;
+    alloc->x = xpos;
     alloc->height = std::min(height, req.height);
+    alloc->y = ypos;
 
     return TRUE;
 }
@@ -1688,6 +1731,7 @@ int main(int argc, char **argv) {
 
     GtkWidget *vte_widget = vte_terminal_new();
     VteTerminal *vte = VTE_TERMINAL(vte_widget);
+    amos_vte = vte;
 
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_style_context_add_class(gtk_widget_get_style_context(hbox),"termite");
@@ -1729,6 +1773,8 @@ int main(int argc, char **argv) {
          nullptr, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, -1, config_file, 0},
         gtk_window_fullscreen
     };
+
+    amos_info = &info;
 
     load_config(GTK_WINDOW(window), vte, scrollbar, hbox, &info.config,
                 icon ? nullptr : &icon, &show_scrollbar);
