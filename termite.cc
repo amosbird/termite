@@ -46,6 +46,24 @@
 #include "fts_fuzzy_match.h"
 #include <iostream>
 
+#include "ctpl.h"
+#include <gio/gio.h>
+#include <iostream>
+#include <stdlib.h>
+#include <unistd.h>
+
+static GDBusNodeInfo* introspection_data = NULL;
+static const char DBUS_NAME_TEMPLATE[] = "com.wentropy.termite.PID-%d";
+
+/* Introspection data for the service we are exporting */
+static const gchar introspection_xml[] = "<node>"
+                                         "  <interface name='com.wentropy.termite'>"
+                                         "    <method name='input'>"
+                                         "      <arg type='s' name='input' direction='in'/>"
+                                         "    </method>"
+                                         "  </interface>"
+                                         "</node>";
+
 using namespace std::placeholders;
 
 /* Allow scales a bit smaller and a bit larger than the usual pango ranges */
@@ -1033,6 +1051,7 @@ gboolean key_press_cb(VteTerminal *vte, GdkEventKey *event, keybind_info *info) 
 }
 
 keybind_info * amos_info;
+GtkWidget * amos_vte_widget;
 VteTerminal * amos_vte;
 
 gboolean amos_matcher(
@@ -1046,46 +1065,37 @@ gboolean amos_matcher(
     return ans;
 }
 
+pid_t pid;
+ctpl::thread_pool p(1);
+
 extern "C"
 {
     void amos_show_completion (char * c) {
-        search_panel_info * info = &amos_info->panel;
-        GtkEntryCompletion *completion = gtk_entry_completion_new();
-        gtk_entry_set_completion(GTK_ENTRY(info->entry), completion);
-        g_object_unref(completion);
+        gint wx, wy;
+        gdk_window_get_origin (gtk_widget_get_window (amos_vte_widget), &wx, &wy);
+        const int width  = gtk_widget_get_allocated_width(amos_vte_widget);
+        const int height = gtk_widget_get_allocated_height(amos_vte_widget);
 
-        GtkListStore *store = gtk_list_store_new(1, G_TYPE_STRING);
-        auto less = [](const char *a, const char *b) { return strcmp(a, b) < 0; };
-        std::set<const char *, decltype(less)> tokens(less);
+        glong x, y;
+        amos_vte_terminal_get_cursor_position(amos_vte, &x, &y);
 
-        for (char *s_ptr = c, *saveptr; ; s_ptr = nullptr) {
-            const char *token = strtok_r(s_ptr, " ", &saveptr);
-            if (!token) {
-                break;
-            }
-            tokens.insert(token);
-        }
+        const int char_width = (int)vte_terminal_get_char_width(amos_vte);
+        const int char_height = (int)vte_terminal_get_char_height(amos_vte);
+        GdkRectangle rec;
+        rec.width  = 320;
 
-        for (const char *token : tokens) {
-            GtkTreeIter iter;
-            gtk_list_store_append(store, &iter);
-            gtk_list_store_set(store, &iter, 0, token, -1);
-        }
+        int xpos = (int)x * char_width - 5;
+        int ypos = (int)y * char_height - 5;
+        if (xpos + rec.width > width)
+            xpos = width - rec.width;
+        rec.x = xpos;
+        rec.y = ypos;
 
-        GtkTreeModel *completion_model = GTK_TREE_MODEL(store);
-
-        gtk_entry_completion_set_model(completion, completion_model);
-        g_object_unref(completion_model);
-
-        gtk_entry_completion_set_inline_selection(completion, TRUE);
-        gtk_entry_completion_set_text_column(completion, 0);
-        gtk_entry_completion_set_match_func(completion, (GtkEntryCompletionMatchFunc)amos_matcher, NULL, NULL);
-
-        gtk_entry_set_text(GTK_ENTRY(info->entry), "");
-
-        info->mode = overlay_mode::completion;
-        gtk_widget_show(info->entry);
-        gtk_widget_grab_focus(info->entry);
+        char cmd [1024];
+        sprintf(cmd, "termite-input %d %d %d", pid, wx + rec.x, wy + rec.y);
+        auto f = popen(cmd, "w");
+        size_t nNumWritten = fwrite(c, 1, strlen(c), f);
+        p.push([f](int) { pclose(f); });
     }
 }
 
@@ -1679,6 +1689,35 @@ static void on_alpha_screen_changed(GtkWindow *window, GdkScreen *, void *) {
     gtk_widget_set_visual(GTK_WIDGET(window), visual);
 }
 
+static void handle_method_call(GDBusConnection* connection, const gchar* sender,
+    const gchar* object_path, const gchar* interface_name, const gchar* method_name,
+    GVariant* parameters, GDBusMethodInvocation* invocation, gpointer user_data) {
+    if (g_strcmp0(method_name, "input") == 0) {
+        const gchar* input;
+        g_variant_get(parameters, "(&s)", &input);
+        vte_terminal_feed_child(amos_vte, input, -1);
+        g_dbus_method_invocation_return_value(invocation, NULL);
+    }
+}
+
+static const GDBusInterfaceVTable interface_vtable = { handle_method_call, NULL, NULL };
+
+static void on_bus_acquired(GDBusConnection* connection, const gchar* name, gpointer user_data) {
+    guint registration_id;
+
+    registration_id = g_dbus_connection_register_object(connection, "/",
+        introspection_data->interfaces[0], &interface_vtable, NULL, /* user_data */
+        NULL, /* user_data_free_func */
+        NULL); /* GError** */
+    g_assert(registration_id > 0);
+}
+
+static void on_name_acquired(GDBusConnection* connection, const gchar* name, gpointer user_data) {}
+
+static void on_name_lost(GDBusConnection* connection, const gchar* name, gpointer user_data) {
+    exit(1);
+}
+
 int main(int argc, char **argv) {
     GError *error = nullptr;
     const char *const term = "xterm-termite";
@@ -1731,6 +1770,7 @@ int main(int argc, char **argv) {
 
     GtkWidget *vte_widget = vte_terminal_new();
     VteTerminal *vte = VTE_TERMINAL(vte_widget);
+    amos_vte_widget = vte_widget;
     amos_vte = vte;
 
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -1895,7 +1935,20 @@ int main(int argc, char **argv) {
 
     g_strfreev(env);
 
+    guint owner_id;
+    GMainLoop* loop;
+    introspection_data = g_dbus_node_info_new_for_xml(introspection_xml, NULL);
+    g_assert(introspection_data != NULL);
+    pid = getpid();
+    char* well_known_name = g_strdup_printf(DBUS_NAME_TEMPLATE, pid);
+    owner_id = g_bus_own_name(G_BUS_TYPE_SESSION, well_known_name, G_BUS_NAME_OWNER_FLAGS_NONE,
+        on_bus_acquired, on_name_acquired, on_name_lost, NULL, NULL);
+    g_free(well_known_name);
+
     gtk_main();
+
+    g_bus_unown_name(owner_id);
+    g_dbus_node_info_unref(introspection_data);
     return EXIT_FAILURE; // child process did not cause termination
 }
 
